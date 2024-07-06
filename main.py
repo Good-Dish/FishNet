@@ -20,37 +20,15 @@ from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, accuracy_score, f1_score
 
 import torch
+
+from imagedataset import ImageDataset
+
 random_seed = 1234 # or any of your favorite number 
 torch.manual_seed(random_seed)
 torch.cuda.manual_seed(random_seed)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 np.random.seed(random_seed)
-
-# Create an argument parser object
-parser = argparse.ArgumentParser(description='A simple argument parser example.')
-
-# Add an argument to the parser
-parser.add_argument('--data_root', type=str, help='parent directory where data is stored', default='Images/')
-parser.add_argument('--csv_file_train', type=str, help='csv file for train data',default='anns/train.csv')
-parser.add_argument('--csv_file_val', type=str, help='csv file for val data',default='anns/test.csv')
-parser.add_argument('--num_workers', type=int, help='number of dataloader workers',default=6)
-parser.add_argument('--label_column', type=str, help='the model will be trained to predict this feature',default="Family")
-parser.add_argument('--batch_size', type=int, help='batch size',default=256)
-parser.add_argument('--epochs', type=int, help='No. of epochs',default=100)
-parser.add_argument('--model', type=int, help='pretrained model to train', default=4)
-parser.add_argument('--wandb', type=str, help='logging to wandb', default='False')
-parser.add_argument('--learning_rate', type=float, help='learning_rate',default=3e-4)
-parser.add_argument('--threshold', type=float, help='learning_rate',default=0.5)
-parser.add_argument('--use_two_fcs', type=bool, help='Whether to use two fcs',default=True)
-parser.add_argument('--finetune', type=bool, help='Whether to finetune backbone network',default=True)
-parser.add_argument('--use_pretrained', action='store_false', help='Whether to pretrained backbone network')
-parser.add_argument('--use_focal', action='store_true', help='Whether to use focal loss')
-parser.add_argument('--loss_type', type=str, help='loss type, choose from [CE,FL,CB,FLCB]',default='CE')
-parser.add_argument('--use_log_freq', type=str, help='use log frequency to sample data', default='False')
-args = parser.parse_args()
-
-print('args', args)
 
 '''
 model mappings
@@ -65,149 +43,12 @@ model mappings
 8 : convnext
 '''
 
-map_models = ['vit_base_patch16_224', 'vit_small_patch16_224','vit_large_patch16_224','resnet34','resnet50','resnet101','resnet152', 'beit_base_patch16_224','convnext_large']
-
-'''wand stuff'''
-
-if args.wandb == 'True':
-    wandb.init(
-        # set the wandb project where this run will be logged
-        project="timm models",
-        
-        # track hyperparameters and run metadata
-        config={
-        "learning_rate": 3e-3,
-        "architecture": map_models[args.model],
-        "dataset": "FISH-NET",
-        "epochs": args.epochs,
-        }
-    )
-    
-
-csv_file_type = 'anns/train_full_meta_new.csv' # read all classes information
-meta_df = pd.read_csv(csv_file_type)
-
-if args.label_column=="Family":
-    labels_common = list(set(np.asarray(meta_df.loc[meta_df['fam_info']==0]['Family_cls'])))
-    labels_medium = list(set(np.asarray(meta_df.loc[meta_df['fam_info']==1]['Family_cls'])))
-    labels_rare = list(set(np.asarray(meta_df.loc[meta_df['fam_info']==2]['Family_cls'])))
-    labels_all = list(set(np.asarray(meta_df.loc[meta_df['fam_info']>=0]['Family_cls'])))
-    all_classes = list(set(meta_df['Family'].values))
-    nClass = len(all_classes)
-elif args.label_column=="Order":
-    labels_common = list(set(np.asarray(meta_df.loc[meta_df['ord_info']==0]['Order_cls'])))
-    labels_medium = list(set(np.asarray(meta_df.loc[meta_df['ord_info']==1]['Order_cls'])))
-    labels_rare = list(set(np.asarray(meta_df.loc[meta_df['ord_info']==2]['Order_cls'])))
-    labels_all = list(set(np.asarray(meta_df.loc[meta_df['ord_info']>0]['Order_cls'])))
-    all_classes = list(set(meta_df['Order_new'].values))
-    nClass = len(all_classes)
-elif args.label_column=="Troph":
-    nClass = 1
-elif args.label_column=="MultiCls":
-    nClass = 9
-    
-print('Classification at {} level, with {} classes:', args.label_column, nClass)
-
-class ImageDataset(Dataset):
-    def __init__(self, csv_file, root_dir, transform=None, label_column="Family", split='Train'):
-        self.data_frame = pd.read_csv(csv_file)
-        if label_column=='Troph':
-            # remove items with Troph are empty 
-            bool_series = pd.isnull(self.data_frame["Troph"]) 
-            self.data_frame = self.data_frame[~bool_series]
-            
-            mu, var = self.data_frame['Troph'].mean(), self.data_frame['Troph'].std()
-            print('Troph mean/variance', mu, var)
-            self.data_frame['Troph'] = (self.data_frame['Troph'] - mu) / var # normalize Trophic values
-        elif label_column == 'MultiCls':
-            # remove items whose attibutes are empty
-            self.all_columns = ['FeedingPath','Tropical','Temperate','Subtropical','Boreal','Polar','freshwater','saltwater','brackish']
-            bool_series  = np.ones(len(self.data_frame),)
-            for col in self.all_columns:
-                bool_col = ~pd.isnull(self.data_frame[col])
-            bool_series = bool_series * bool_col
-            self.data_frame = self.data_frame[bool_series.astype(np.bool)]
-            
-        # select the ratio to train
-        self.root_dir = root_dir
-        self.transform = transform
-        self.label_col = label_column
-        self.image_col = "image"
-        self.folder_col = "Folder"
-        print('csv file: {} has {} item.'.format(csv_file, len(self.data_frame)))
-
-    def __len__(self):
-        return len(self.data_frame)
-
-    def __getitem__(self, idx):
-        
-        img_name = self.data_frame.iloc[idx][self.image_col]
-        img_name = img_name.split('/')[-1]
-        folder = self.data_frame.iloc[idx][self.folder_col]
-        img_path = os.path.join(folder,img_name)
-        image = Image.open(self.root_dir + img_path)
-        
-        if self.label_col=="Family":
-            cls_name = self.data_frame.iloc[idx][self.label_col]
-            label = meta_df.loc[meta_df['Family']==cls_name]['Family_cls'].values[0]
-        elif self.label_col=="Order":
-            cls_name = self.data_frame.iloc[idx][self.label_col]
-            if '/' in cls_name:
-                cls_name = cls_name.split('/')[0]
-            label = meta_df.loc[meta_df['Order_new']==cls_name]['Order_cls'].values[0]
-        elif self.label_col=='Troph':
-            label = self.data_frame.iloc[idx][self.label_col]
-#             label = all_classes.index(cls_name)
-        elif self.label_col=='MultiCls':
-            label = []
-            for col in self.all_columns:
-                val = self.data_frame.iloc[idx][col]
-                if col == 'FeedingPath':
-                    if val =='pelagic':
-                        val = 1
-                    elif val =='benthic':
-                        val = 0
-                label.append(val)
-            label = np.asarray(label)
-        if self.transform:
-            image = self.transform(image)
-        return (image, label,self.root_dir + img_path)
-
-transform = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
-
-
-dataset_train = ImageDataset(csv_file=args.csv_file_train, root_dir=args.data_root, transform=transform, label_column=args.label_column)
-dataset_val = ImageDataset(csv_file=args.csv_file_val, root_dir=args.data_root, transform=transform, label_column=args.label_column)
-
-
-train_loader = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True,
-                    drop_last=False, num_workers=args.num_workers, pin_memory=True)
-validation_loader = torch.utils.data.DataLoader(dataset_val, batch_size=args.batch_size,
-                    drop_last=False, num_workers=args.num_workers, pin_memory=True)
-
-
-final_layers = {'resnet34':512, 'resnet50':2048, 'resnet101':2048, 'resnet152':2048, 'vgg16':4096, 'vit_base_patch16_224': 768, 'vit_small_patch16_224': 384, 'vit_large_patch16_224': 1024, 'beit_base_patch16_224': 768}
-
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-if args.loss_type in ['CB', 'FLCB']:
-    all_gts = []
-    for i, (img,labels,_) in enumerate(tqdm(train_loader)):
-        all_gts.append(labels)
-    all_gts = np.concatenate(all_gts)
-    unique, samples_per_class = np.unique(all_gts, return_counts=True)
-    if args.use_log_freq:
-        samples_per_class = np.log(samples_per_class)
         
 class FocalLoss(nn.Module):
     def __init__(self, gamma=0, alpha=None, size_average=True):
@@ -279,8 +120,10 @@ def validate(val_loader, model, criterion):
     all_preds = []
     all_gts = []
     for i, (img,labels,_) in enumerate(tqdm(val_loader)):
-        inputs = img.cuda()
-        target1 = labels.cuda().long()
+        inputs = img
+        # inputs = img.cuda()
+        target1 = labels.long()
+        # target1 = labels.cuda().long()
         with torch.no_grad():
             outputs  = model(inputs)
         outputs = torch.max(outputs,-1)[1]
@@ -367,100 +210,210 @@ def validate_reg(val_loader, model, criterion):
     
     return -mae # make it the larger the better
 
-# pdb.set_trace()
-print('Creating Model....', map_models[args.model])
-model = timm.create_model(map_models[args.model], pretrained=args.use_pretrained, num_classes=nClass).cuda()
-if not ('beit' in map_models[args.model] or 'convnext' in map_models[args.model]):
-    print('do not use two FCs')
-    model = Classifiers(model, finetune=args.finetune, use_two_fcs=args.use_two_fcs).cuda()
-    optimizer = optim.Adam([
-                            {'params': model.model.parameters(), 'lr': args.learning_rate * 0.1},
-                            {'params': model.linear.parameters(), 'lr': args.learning_rate}
-                        ])
-else:
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
-if args.label_column =='Troph':
-    criterion = nn.MSELoss()
-elif args.label_column =='Family' or args.label_column =='Order':
-    
-    from balanced_loss import Loss
-    
-    if args.loss_type=='FL':
-        focal_loss = Loss(loss_type="focal_loss",fl_gamma=2)
-        criterion = focal_loss.cuda()
-    elif args.loss_type=='CB':
-        ce_loss = Loss(
-            loss_type="cross_entropy",
-            samples_per_class=samples_per_class,
-            class_balanced=True
+if __name__ =='__main__':
+    # Create an argument parser object
+    parser = argparse.ArgumentParser(description='A simple argument parser example.')
+
+    # Add an argument to the parser
+    parser.add_argument('--data_root', type=str, help='parent directory where data is stored', default='dataset/')
+    parser.add_argument('--csv_file_train', type=str, help='csv file for train data', default='anns/train.csv')
+    parser.add_argument('--csv_file_val', type=str, help='csv file for val data', default='anns/test.csv')
+    parser.add_argument('--num_workers', type=int, help='number of dataloader workers', default=6)
+    parser.add_argument('--label_column', type=str, help='the model will be trained to predict this feature',
+                        default="Family")
+    parser.add_argument('--batch_size', type=int, help='batch size', default=5)
+    parser.add_argument('--epochs', type=int, help='No. of epochs', default=100)
+    parser.add_argument('--model', type=int, help='pretrained model to train', default=4)
+    parser.add_argument('--wandb', type=str, help='logging to wandb', default='False')
+    parser.add_argument('--learning_rate', type=float, help='learning_rate', default=3e-4)
+    parser.add_argument('--threshold', type=float, help='learning_rate', default=0.5)
+    parser.add_argument('--use_two_fcs', type=bool, help='Whether to use two fcs', default=True)
+    parser.add_argument('--finetune', type=bool, help='Whether to finetune backbone network', default=True)
+    parser.add_argument('--use_pretrained', action='store_false', help='Whether to pretrained backbone network')
+    parser.add_argument('--use_focal', action='store_true', help='Whether to use focal loss')
+    parser.add_argument('--loss_type', type=str, help='loss type, choose from [CE,FL,CB,FLCB]', default='CE')
+    parser.add_argument('--use_log_freq', type=str, help='use log frequency to sample data', default='False')
+    args = parser.parse_args()
+
+    # print('args', args)
+
+    csv_file_type = 'anns/train_full_meta_new.csv'  # read all classes information
+    meta_df = pd.read_csv(csv_file_type)
+
+    map_models = ['vit_base_patch16_224', 'vit_small_patch16_224', 'vit_large_patch16_224', 'resnet34', 'resnet50',
+                  'resnet101', 'resnet152', 'beit_base_patch16_224', 'convnext_large']
+
+    '''wand stuff'''
+
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+    dataset_train = ImageDataset(csv_file=args.csv_file_train, root_dir=args.data_root, transform=transform,
+                                 label_column=args.label_column)
+    dataset_val = ImageDataset(csv_file=args.csv_file_val, root_dir=args.data_root, transform=transform,
+                               label_column=args.label_column)
+
+    train_loader = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True,
+                                               drop_last=False, num_workers=args.num_workers, pin_memory=True)
+    validation_loader = torch.utils.data.DataLoader(dataset_val, batch_size=args.batch_size,
+                                                    drop_last=False, num_workers=args.num_workers, pin_memory=True)
+
+    final_layers = {'resnet34': 512, 'resnet50': 2048, 'resnet101': 2048, 'resnet152': 2048, 'vgg16': 4096,
+                    'vit_base_patch16_224': 768, 'vit_small_patch16_224': 384, 'vit_large_patch16_224': 1024,
+                    'beit_base_patch16_224': 768}
+
+    if args.wandb == 'True':
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="timm models",
+
+            # track hyperparameters and run metadata
+            config={
+                "learning_rate": 3e-3,
+                "architecture": map_models[args.model],
+                "dataset": "FISH-NET",
+                "epochs": args.epochs,
+            }
         )
-        criterion = ce_loss.cuda()
-    elif args.loss_type=='FLCB':
-        # class-balanced focal loss
-        focal_loss = Loss(
-            loss_type="focal_loss",
-            beta=0.999, # class-balanced loss beta
-            fl_gamma=2, # focal loss gamma
-            samples_per_class=samples_per_class,
-            class_balanced=True
-        )
-        criterion = focal_loss.cuda()
-    else: # default CE loss
-        criterion = nn.CrossEntropyLoss()
-elif args.label_column =='MultiCls':
-    criterion = nn.BCEWithLogitsLoss()
-    
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
-if torch.cuda.device_count() >= 1:
-    print("Let's use", torch.cuda.device_count(), "GPUs!")
-    model = nn.DataParallel(model)
-    
-#train model
-best_score = -99999
-delta = float(0.0000001)
-print('Starting Training...')
-for epoch in range(args.epochs):
-    for batch_idx, (img, labels,_) in enumerate(tqdm(train_loader)):
+    if args.label_column == "Family":
+        labels_common = list(set(np.asarray(meta_df.loc[meta_df['fam_info'] == 0]['Family_cls'])))
+        labels_medium = list(set(np.asarray(meta_df.loc[meta_df['fam_info'] == 1]['Family_cls'])))
+        labels_rare = list(set(np.asarray(meta_df.loc[meta_df['fam_info'] == 2]['Family_cls'])))
+        labels_all = list(set(np.asarray(meta_df.loc[meta_df['fam_info'] >= 0]['Family_cls'])))
+        all_classes = list(set(meta_df['Family'].values))
+        nClass = len(all_classes)
+    elif args.label_column == "Order":
+        labels_common = list(set(np.asarray(meta_df.loc[meta_df['ord_info'] == 0]['Order_cls'])))
+        labels_medium = list(set(np.asarray(meta_df.loc[meta_df['ord_info'] == 1]['Order_cls'])))
+        labels_rare = list(set(np.asarray(meta_df.loc[meta_df['ord_info'] == 2]['Order_cls'])))
+        labels_all = list(set(np.asarray(meta_df.loc[meta_df['ord_info'] > 0]['Order_cls'])))
+        all_classes = list(set(meta_df['Order_new'].values))
+        nClass = len(all_classes)
+    elif args.label_column == "Troph":
+        nClass = 1
+    elif args.label_column == "MultiCls":
+        nClass = 9
 
-        inputs = img.cuda()
-        target1 = labels.cuda()
-        if args.label_column =='Troph':
-            target1 = target1.float()
-        else:
-            target1 = target1.long()
-        
-        output1 = model(inputs)
-        loss = criterion(output1, target1)
-        
-        if not batch_idx %50:
-            print('Epoch : %d , i : %d    loss : %0.3f'%(epoch, batch_idx, loss.data.cpu().item()),flush=True)
-            
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    print('Classification at {} level, with {} classes:', args.label_column, nClass)
 
-    scheduler.step()
-        
-    print(f'End of epoch: {epoch}  loss : {loss.cpu().item()} ',flush=True)
-    if( epoch%5 == 0) or (epoch>30 and epoch%2 == 0):
-        if args.label_column =='Troph':
-            avg_score = validate_reg(validation_loader,model,criterion)
-        elif args.label_column=="MultiCls":
-            avg_score = validate_multi(validation_loader,model,criterion)
-        else:
-            avg_score = validate(validation_loader,model,criterion)
 
-        if avg_score > best_score:
-            if args.loss_type!='CE':
-                ckpt_name = map_models[args.model] + '_' + str(args.label_column) + str(args.loss_type) + '.pt'
+    if args.loss_type in ['CB', 'FLCB']:
+        all_gts = []
+        for i, (img, labels, _) in enumerate(tqdm(train_loader)):
+            all_gts.append(labels)
+        all_gts = np.concatenate(all_gts)
+        unique, samples_per_class = np.unique(all_gts, return_counts=True)
+        if args.use_log_freq:
+            samples_per_class = np.log(samples_per_class)
+
+    # pdb.set_trace()
+    print('Creating Model....', map_models[args.model])
+    model = timm.create_model(map_models[args.model], pretrained=args.use_pretrained, num_classes=nClass,
+                              pretrained_cfg_overlay=dict(file='pytorch_model.bin'))
+    # model = timm.create_model(map_models[args.model], pretrained=args.use_pretrained, num_classes=nClass).cuda()
+    if not ('beit' in map_models[args.model] or 'convnext' in map_models[args.model]):
+        print('do not use two FCs')
+        model = Classifiers(model, finetune=args.finetune, use_two_fcs=args.use_two_fcs)
+        # model = Classifiers(model, finetune=args.finetune, use_two_fcs=args.use_two_fcs).cuda()
+        optimizer = optim.Adam([
+            {'params': model.model.parameters(), 'lr': args.learning_rate * 0.1},
+            {'params': model.linear.parameters(), 'lr': args.learning_rate}
+        ])
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+
+    if args.label_column == 'Troph':
+        criterion = nn.MSELoss()
+    elif args.label_column == 'Family' or args.label_column == 'Order':
+
+        from balanced_loss import Loss
+
+        if args.loss_type == 'FL':
+            focal_loss = Loss(loss_type="focal_loss", fl_gamma=2)
+            criterion = focal_loss
+            # criterion = focal_loss.cuda()
+        elif args.loss_type == 'CB':
+            ce_loss = Loss(
+                loss_type="cross_entropy",
+                samples_per_class=samples_per_class,
+                class_balanced=True
+            )
+            criterion = ce_loss
+            # criterion = ce_loss.cuda()
+        elif args.loss_type == 'FLCB':
+            # class-balanced focal loss
+            focal_loss = Loss(
+                loss_type="focal_loss",
+                beta=0.999,  # class-balanced loss beta
+                fl_gamma=2,  # focal loss gamma
+                samples_per_class=samples_per_class,
+                class_balanced=True
+            )
+            criterion = focal_loss.cuda()
+        else:  # default CE loss
+            criterion = nn.CrossEntropyLoss()
+    elif args.label_column == 'MultiCls':
+        criterion = nn.BCEWithLogitsLoss()
+
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+
+    if torch.cuda.device_count() >= 1:
+        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        model = nn.DataParallel(model)
+
+    #train model
+    best_score = -99999
+    delta = float(0.0000001)
+    print('Starting Training...')
+    for epoch in range(args.epochs):
+        for batch_idx, (img, labels,_) in enumerate(tqdm(train_loader)):
+
+            inputs = img
+            # inputs = img.cuda()
+            target1 = labels
+            # target1 = labels.cuda()
+            if args.label_column =='Troph':
+                target1 = target1.float()
             else:
-                ckpt_name = map_models[args.model] + '_' + str(args.label_column) + '.pt'
-            torch.save(model.state_dict(), ckpt_name)
-            best_score = avg_score
-            print('best score', best_score)
-        if args.wandb == 'True':
-            wandb.log({"acc": avg_score, "lr": scheduler.get_lr()[0]})
-if args.wandb == 'True':
-    wandb.finish()
+                target1 = target1.long()
+
+            output1 = model(inputs)
+            loss = criterion(output1, target1)
+
+            if not batch_idx %50:
+                print('Epoch : %d , i : %d    loss : %0.3f'%(epoch, batch_idx, loss.data.cpu().item()),flush=True)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        scheduler.step()
+
+        print(f'End of epoch: {epoch}  loss : {loss.cpu().item()} ',flush=True)
+        if( epoch%5 == 0) or (epoch>30 and epoch%2 == 0):
+            if args.label_column =='Troph':
+                avg_score = validate_reg(validation_loader,model,criterion)
+            elif args.label_column=="MultiCls":
+                avg_score = validate_multi(validation_loader,model,criterion)
+            else:
+                avg_score = validate(validation_loader,model,criterion)
+
+            if avg_score > best_score:
+                if args.loss_type!='CE':
+                    ckpt_name = map_models[args.model] + '_' + str(args.label_column) + str(args.loss_type) + '.pt'
+                else:
+                    ckpt_name = map_models[args.model] + '_' + str(args.label_column) + '.pt'
+                torch.save(model.state_dict(), ckpt_name)
+                best_score = avg_score
+                print('best score', best_score)
+            if args.wandb == 'True':
+                wandb.log({"acc": avg_score, "lr": scheduler.get_lr()[0]})
+    if args.wandb == 'True':
+        wandb.finish()
